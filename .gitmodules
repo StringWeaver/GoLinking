@@ -10,3 +10,6 @@
 [submodule "karing"]
 	path = karing
 	url = https://github.com/StringWeaver/karing.git
+[submodule "sing-box"]
+	path = sing-box
+	url = https://github.com/StringWeaver/sing-box.git
