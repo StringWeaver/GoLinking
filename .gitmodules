@@ -1,3 +1,12 @@
 [submodule "purego_winrt/winrt-api"]
 	path = winrt-api
 	url = https://github.com/MicrosoftDocs/winrt-api.git
+[submodule "sing-tun"]
+	path = sing-tun
+	url = https://github.com/StringWeaver/sing-tun.git
+[submodule "Maple"]
+	path = Maple
+	url = https://github.com/StringWeaver/Maple.git
+[submodule "karing"]
+	path = karing
+	url = https://github.com/StringWeaver/karing.git
