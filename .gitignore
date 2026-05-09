@@ -1,8 +1,8 @@
 # Build output
 build/
 
-# Go
-golib/golib.h
+# Go generated headers
+*.h
 
 # Visual Studio / MSVC
 *.obj
@@ -12,6 +12,7 @@ golib/golib.h
 *.lib
 *.dll
 *.exe
+*.def
 
 # OS
 Thumbs.db

@@ -1,0 +1,3 @@
+[submodule "purego_winrt/winrt-api"]
+	path = winrt-api
+	url = https://github.com/MicrosoftDocs/winrt-api.git
