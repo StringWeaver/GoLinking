@@ -7,3 +7,6 @@
 [submodule "sing-tun"]
 	path = sing-tun
 	url = https://github.com/StringWeaver/sing-tun.git
+[submodule "sing-box"]
+	path = sing-box
+	url = https://github.com/SagerNet/sing-box.git
