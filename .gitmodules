@@ -4,3 +4,6 @@
 [submodule "Maple"]
 	path = Maple
 	url = https://github.com/StringWeaver/Maple.git
+[submodule "sing-tun"]
+	path = sing-tun
+	url = https://github.com/StringWeaver/sing-tun.git
