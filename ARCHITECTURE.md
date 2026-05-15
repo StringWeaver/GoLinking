@@ -7,10 +7,10 @@
 整个应用运行在**前端 App 进程 (AppContainer 沙盒)**内，采用纯 C++ 宿主加载 libbox 主控 + VpnBridge.dll 桥接的模式：
 
 ### 层级 1: 前端应用 (UI & 引擎主控)
-- **形式**: 纯 C++ / WinRT 构建的 UWP 应用程序，通过 CMake 编译生成。
+- **形式**: 纯 C++ / WinRT 构建的 UWP 应用程序 (CoreWindow)，通过 CMake 编译生成。
 - **UI 极简设计**: 
-  - UWP 原生 `ToggleSwitch` 用于控制 VPN 开关。
-  - 内嵌 `WebView2` 控件，直接访问 `libbox` 暴露的本地 `clash_api` 面板（例如 `http://127.0.0.1:9090/ui`），将复杂的配置和节点控制交由 Web 前端处理。
+  - 彻底放弃脆弱的 CMake XAML 编译。应用本身是一个极简的 UWP CoreWindow（无界面背景）。
+  - 在启动并连接 VPN 后，利用 `Launcher::LaunchUriAsync` 自动唤起系统外置浏览器（Edge/Chrome），跳转至 `http://127.0.0.1:9090/ui` 展示 Web 控制台。
 - **职责**: 
   - 通过 `LoadPackagedLibrary` 动态加载 `libbox.dll`。
   - 获取 `Setup`、`StartOrReloadService`、`CloseService` 等 C 导出函数指针，完全掌控引擎生命周期。
@@ -41,11 +41,10 @@
 
 ```text
 前端 App 进程 (UWP App.exe, AppContainer 沙盒):
-  ├── UI 层
-  │     ├── ToggleSwitch (开关)
-  │     └── WebView2 (访问 http://127.0.0.1:9090/ui)
+  ├── UI 层 (极简 / 无头化)
+  │     └── 启动时自动唤起外部浏览器 (Edge) -> http://127.0.0.1:9090/ui
   │
-  ├── C++ 主控逻辑
+  ├── C++ 主控逻辑 (CoreWindow / IFrameworkView)
   │     └── LoadPackagedLibrary("libbox.dll") -> Setup / Start / Close
   │
   ├── libbox.dll (Go c-shared)
@@ -69,7 +68,7 @@
 ### 核心收益
 
 1. **彻底免驱与免提权**: 利用 `windows.networking.vpn` 规范，摒弃了 `wintun`，不再需要管理员权限，不会触发 UAC 弹窗。
-2. **极简的前端开发**: UWP 只负责一个开关和一个 WebView2 浏览器容器，所有的节点测速、配置修改均由 Web 界面完成，剥离了繁重的 GUI 状态管理。
+2. **极简的前端开发**: UWP 彻底抛弃了 XAML 和 GUI 负担，变为一个隐形的“启动器”。所有的节点测速、配置修改均由自动弹出的 Web 界面完成。
 3. **闭环在 C/C++ 生态中**: 相比于 Flutter/Dart FFI，C++ UWP 加载 `libbox.dll` 的 C 导出函数是原生的、最自然的方式。
 4. **无需跨进程通信**: sing-box 引擎和 TUN 设备在同一个进程里，出站包直接通过内存指针投递，入站包通过 `purego` 注入系统，性能损耗极低。
 
@@ -196,21 +195,52 @@ add_library(VpnBridge SHARED VpnBridge.cpp module.g.cpp VpnTask.cpp ...)
 在工程外层 `CMakeLists.txt` 中开启 UWP 构建：
 ```cmake
 add_executable(UwpHost WIN32 App.cpp AppxManifest.xml ...)
-set_property(TARGET UwpHost PROPERTY VS_WINRT_COMPONENT TRUE)
+set_property(TARGET UwpHost PROPERTY VS_WINRT_COMPONENT FALSE)
 ```
-- 利用 CMake 的 `add_custom_command` 将 `libbox.dll` 和 `VpnBridge.dll` 拷贝至 `UwpHost` 产物目录下，打包成 MSIX 或 AppX。
+- 为了避开 CMake 编译 UWP XAML 的严重路径 Bug，UWP 宿主已被设计为**纯 CoreWindow (无 XAML)**。
+- 编译完成后，将 `libbox.dll`、`VpnBridge.dll` 和 `UwpHost.exe` 拷贝至 `AppxLayout` 目录下，并使用 `Add-AppxPackage -Register` 进行开发者注册和免打包调试。
 
 ---
 
-## 7. 与 Wintun 模式的对比
+## 7. 调试与日志分析 (UWP AppContainer)
+
+由于沙盒环境隔离，UWP 应用**无法**将日志输出到控制台或普通的相对路径下。如果你在开发时遇到无端闪退或连接失败，请按以下步骤进行排查：
+
+### 1. 查找崩溃与系统拦截 (Event Viewer)
+如果应用点击后毫无反应甚至闪退，通常是 COM 初始化、架构不匹配或 Go `panic()` 引发的 abort。
+打开 PowerShell 运行：
+```powershell
+# 查看应用程序崩溃记录
+Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'} -MaxEvents 3
+
+# 查看 UWP 生命周期的拦截或权限报错
+Get-WinEvent -LogName "Microsoft-Windows-TWinUI/Operational" -MaxEvents 3 | Format-List -Property Message
+```
+
+### 2. 查阅本地运行日志 (LocalState)
+我们在 UWP 的 `App.cpp` 中获取了沙盒本地存储路径，并将 C++ 和 Go (libbox) 的运行日志重定向到了该目录中：
+```powershell
+# UWP 应用存储沙盒路径
+$env:LOCALAPPDATA\Packages\SingTun.UwpHost_gbfdrcbt587gt\LocalState
+
+# 查看 C++ 主控和 DLL 加载流程的日志
+cat $env:LOCALAPPDATA\Packages\SingTun.UwpHost_gbfdrcbt587gt\LocalState\debug.log
+
+# 查看 Go 引擎内部发生 panic 或 os.Stderr 的崩溃输出
+cat $env:LOCALAPPDATA\Packages\SingTun.UwpHost_gbfdrcbt587gt\LocalState\stderr.log
+```
+
+---
+
+## 8. 与 Wintun 模式的对比
 
 | | Wintun 模式 (旧架构) | WinRT VPN 模式 (UWP C++ 架构) |
 |---|---|---|
 | **TUN 实现** | `NativeTun` (wintun.dll) | `winRTVpn` (windows.networking.vpn) |
 | **需要管理员权限** | ✅ 需要（UAC 弹窗提权） | ❌ 不需要，纯沙盒模式 |
-| **前端程序** | Tauri / Rust (或者 Flutter) | 纯 C++ / WinRT XAML (UWP) |
+| **前端程序** | Tauri / Rust (或者 Flutter) | 纯 C++ UWP CoreWindow (无头) |
 | **通信架构** | UI 进程 --(命名管道)--> 后台特权服务 | 纯单进程，UI 直接 LoadPackagedLibrary |
-| **GUI 渲染** | 重客户端 (Tauri/Flutter 渲染) | 轻量壳 (原生 ToggleSwitch + 内嵌 WebView2) |
+| **GUI 渲染** | 重客户端 (Tauri/Flutter 渲染) | 轻量壳 (仅唤起系统浏览器显示 WebUI) |
 | **出站入口** | Go 主动轮询 Ring Buffer | C++ 回调 → Go 函数指针 |
 | **入站注入** | 直接写 Ring Buffer | purego → VpnChannel_InjectPacket |
-| **开发体验** | 涉及 IPC、特权服务、双端打包 | 一个 CMake 工程编译出全部闭环产物 |
+| **开发体验** | 涉及 IPC、特权服务、双端打包 | 极简 CMake 构建出闭环产物 |

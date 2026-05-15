@@ -57,6 +57,13 @@ func LibboxStart(configJSON *C.char, workingDir *C.char) *C.char {
 	}
 
 	var err error
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+
 	instance, err = box.New(box.Options{
 		Context: ctx,
 		Options: options,
