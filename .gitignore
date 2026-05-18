@@ -2,7 +2,7 @@
 build/
 
 # Go generated headers
-*.h
+libbox.h
 
 # Visual Studio / MSVC
 *.obj
@@ -12,7 +12,6 @@ build/
 *.lib
 *.dll
 *.exe
-*.def
 
 # OS
 Thumbs.db
