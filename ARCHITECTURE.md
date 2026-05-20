@@ -175,7 +175,23 @@ func injectPacketToWinRT(packet []byte) bool {
 
 ### 阶段一：构建 Go 代理核心 (libbox.dll)
 
-因为 `-buildmode=c-shared` 要求入口为 `main` 包，我们需要创建一个封装用的 `go_dll` 目录（包含 `main.go` 并配置 `go.mod` 替换本地代码），在此目录下运行构建。必须包含 `with_winrt_vpn` 标签：
+因为 `-buildmode=c-shared` 要求入口为 `main` 包，我们需要创建一个封装用的 `go_dll` 目录（包含 `main.go` 并配置 `go.mod` 替换本地代码），在此目录下运行构建。
+
+**注意：** 如果你修改了本地的 `sing-tun` 或 `sing-box` 代码，需要在 `sing-box` 和 `go_dll` 目录下的 `go.mod` 中使用 `replace` 指令指向本地相对路径：
+```powershell
+# 在 sing-box 目录下执行，让引擎引用本地的 sing-tun
+cd ../sing-box
+go mod edit -replace github.com/sagernet/sing-tun=../sing-tun
+go mod tidy
+
+# 在 go_dll 目录下执行
+cd ../go_dll
+go mod edit -replace github.com/sagernet/sing-box=../sing-box
+go mod edit -replace github.com/sagernet/sing-tun=../sing-tun
+go mod tidy
+```
+
+必须包含 `with_winrt_vpn` 标签：
 ```powershell
 cd go_dll
 $env:CGO_ENABLED="1"
@@ -184,21 +200,42 @@ go build -buildmode=c-shared -v -trimpath -tags "with_gvisor,with_quic,with_wire
 
 ### 阶段二：构建 C++/WinRT 桥接层 (VpnBridge.dll)
 
-在 `CMakeLists.txt` 中单独配置：
-```cmake
-add_library(VpnBridge SHARED VpnBridge.cpp module.g.cpp VpnTask.cpp ...)
-# 使用自定义的 cppwinrt.exe 和 midlrt.exe 命令解决 CMake VS_WINRT_COMPONENT 的坑
+在 `sing-tun\winrt_vpn` 目录中使用 CMake 进行构建：
+```powershell
+cd sing-tun/winrt_vpn
+mkdir build
+cd build
+cmake .. -A x64
+cmake --build . --config Release
+```
+编译完成后，会生成 `build\Release\VpnBridge.dll`。
+
+### 阶段三：构建 UWP 宿主应用 (App.exe) 并注册
+
+在工程外层 `UwpHost` 目录中开启 UWP 构建：
+```powershell
+cd UwpHost
+mkdir build
+cd build
+cmake .. -A x64
+cmake --build . --config Release
 ```
 
-### 阶段三：构建 UWP 宿主应用 (App.exe)
-
-在工程外层 `CMakeLists.txt` 中开启 UWP 构建：
-```cmake
-add_executable(UwpHost WIN32 App.cpp AppxManifest.xml ...)
-set_property(TARGET UwpHost PROPERTY VS_WINRT_COMPONENT FALSE)
-```
 - 为了避开 CMake 编译 UWP XAML 的严重路径 Bug，UWP 宿主已被设计为**纯 CoreWindow (无 XAML)**。
-- 编译完成后，将 `libbox.dll`、`VpnBridge.dll` 和 `UwpHost.exe` 拷贝至 `AppxLayout` 目录下，并使用 `Add-AppxPackage -Register` 进行开发者注册和免打包调试。
+- 编译完成后，将前两个阶段生成的 `libbox.dll`、`VpnBridge.dll` 以及本阶段生成的 `UwpHost.exe` 拷贝至 `AppxLayout` 目录下。
+- 最后，在 PowerShell 中使用 `Add-AppxPackage -Register` 进行开发者注册和免打包调试：
+
+```powershell
+# 1. 复制所有生成的产物到 AppxLayout 目录
+Copy-Item "build\Release\UwpHost.exe" -Destination "AppxLayout" -Force
+Copy-Item "..\sing-tun\winrt_vpn\build\Release\VpnBridge.dll" -Destination "AppxLayout" -Force
+Copy-Item "..\build\libbox.dll" -Destination "AppxLayout" -Force
+
+# 2. 注册 UWP 应用
+Add-AppxPackage -Register "AppxLayout\AppxManifest.xml"
+```
+
+注册成功后，即可在系统“开始”菜单中找到并启动该应用。
 
 ---
 
