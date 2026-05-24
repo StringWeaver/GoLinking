@@ -67,7 +67,7 @@
 1. **彻底免驱与免提权**: 利用 `windows.networking.vpn` 规范，摒弃了 `wintun`，不再需要管理员权限，不会触发 UAC 弹窗。
 2. **极简的前端开发**: UWP 彻底抛弃了 XAML 和 GUI 负担，变为一个隐形的“启动器”。所有的节点测速、配置修改均由自动弹出的 Web 界面完成。
 3. **闭环在 C/C++ 生态中**: 相比于 Flutter/Dart FFI，C++ UWP 加载 `libbox.dll` 的 C 导出函数是原生的、最自然的方式。
-4. **无需跨进程通信**: sing-box 引擎和 TUN 设备在同一个进程里，出站包直接通过内存指针投递，入站包通过 `purego` 注入系统，性能损耗极低。
+4. **无需跨进程通信**: sing-box 引擎和 TUN 设备在同一个后台进程 (`SingBox.Task`) 里，出站包直接通过内存指针投递，入站包通过 `purego` 注入系统，性能损耗极低。
 
 ---
 
@@ -77,7 +77,7 @@
 
 | 原则 | 说明 |
 |---|---|
-| **Go 侧主控** | libbox 通过 purego 加载 VpnBridge.dll，而非 VpnBridge 加载 libbox |
+| **单一宿主加载** | UWP 后台组件 `SingBox.Task.dll` 既是 Windows VPN 插件的宿主，也是 C 导出函数的提供者。Go 的 `purego` 直接在当前进程查找 `SingBox.Task.dll` 中的符号，**废弃了独立的 VpnBridge.dll** |
 | **函数指针替代 //export** | 用 `syscall.NewCallback` 将 Go 函数转为 C 函数指针，注册到 C++ |
 | **零 CGO 额外成本** | sing-tun 完全 purego，无需 `//export`，不引入任何 CGO 依赖 |
 | **纯 C 接口边界** | Go 和 C++ 之间只传递纯 C 标量（指针 + 长度），无 WinRT 类型跨越 DLL 边界 |
