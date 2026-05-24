@@ -37,32 +37,29 @@
 
 ---
 
-## 2. 单进程架构（纯 C++ UWP 主控）
+## 2. 单进程 vs 双进程架构（当前采用双进程 UWP 架构）
+
+根据实际调试和 UWP 机制，当前采用 **双进程结构**：
 
 ```text
-前端 App 进程 (UWP App.exe, AppContainer 沙盒):
-  ├── UI 层 (极简 / 无头化)
-  │     └── 启动时自动唤起外部浏览器 (Edge) -> http://127.0.0.1:9090/ui
-  │
-  ├── C++ 主控逻辑 (CoreWindow / IFrameworkView)
-  │     └── LoadPackagedLibrary("libbox.dll") -> Setup / Start / Close
-  │
-  ├── libbox.dll (Go c-shared)
-  │     ├── sing-box 完整引擎（路由、代理、DNS...）
-  │     ├── clash_api (提供本地控制台和 REST API)
-  │     └── sing-tun (winRTVpn, purego 零 CGO)
-  │           ├── purego → LoadLibrary("VpnBridge.dll")
-  │           ├── syscall.NewCallback(goOnEncapsulate) → 注册到 C++
-  │           ├── Read()  ← Go 回调写入 packetChan
-  │           └── Write() → purego → VpnChannel_InjectPacket
-  │
-  └── VpnBridge.dll (C++/WinRT 桥接层, 系统注入后台任务)
-        ├── IVpnPlugIn 实现 (Connect/Disconnect/Encapsulate/Decapsulate)
-        ├── IBackgroundTask::Run → VpnChannel::ProcessEventAsync
-        ├── Encapsulate() → 直接调用 Go 传来的 onEncapsulate 函数指针
-        └── 导出: VpnBridge_RegisterPlugin / VpnBridge_InitCOM / VpnChannel_InjectPacket
+1. 前端 UI 进程 (SingBox.App.exe):
+  ├── UI 层
+  │     └── 提供配置面板、日志显示、开关控制 (如 WebView2)
+  └── 职责: 注册 VPN Profile，调用 Connect/Disconnect API，向后台发送配置指令。
 
-  单进程闭环，完全基于 C/C++ 生态，免提权，无需跨进程通信 ✅
+2. 后台 VPN 进程 (由系统拉起的特权沙盒进程):
+  ├── SingBox.Task (Windows 运行时组件, C++/WinRT)
+  │     ├── 实现 IVpnPlugIn 接口
+  │     ├── LoadPackagedLibrary("libbox.dll") -> Setup / Start / Close
+  │     └── 导出: VpnBridge_RegisterPlugin / VpnBridge_InitCOM / VpnChannel_InjectPacket
+  │
+  └── libbox.dll (Go c-shared)
+        ├── sing-box 完整引擎（路由、代理、DNS...）
+        └── sing-tun (winRTVpn, purego 零 CGO)
+              ├── purego → 绑定 SingBox.Task.dll 导出的函数
+              ├── syscall.NewCallback(goOnEncapsulate) → 注册到 C++
+              ├── Read()  ← Go 回调写入 packetChan
+              └── Write() → purego → VpnChannel_InjectPacket
 ```
 
 ### 核心收益
@@ -142,27 +139,22 @@ func injectPacketToWinRT(packet []byte) bool {
 ### 完整连接时序
 
 ```text
-[前端 UWP App 启动]
+[前端 UWP App (SingBox.App) 启动]
        │
-       │ (1. C++ 通过 LoadPackagedLibrary 加载 libbox.dll)
-       │ (2. 获取 LocalFolder 并通过 Setup 传给 libbox)
-       │ (3. UWP WebView2 访问 127.0.0.1:9090/ui 展示配置面板)
-       │ (4. purego 加载 VpnBridge.dll)
-       │ (5. 调用 VpnBridge_InitCOM() 初始化 COM)
-       │ (6. syscall.NewCallback(goOnEncapsulate) 生成 C 函数指针)
-       │ (7. 调用 VpnBridge_RegisterPlugin(cb) 注册出站回调)
-       │ (8. 调用 libbox.Start 启动引擎)
+       │ (1. UI 初始化，内嵌 WebView2 准备访问 127.0.0.1:9090)
+       │ (2. 检查并向系统注册 VpnPlugInProfile)
+       │ (3. 用户点击“连接”按钮触发系统 VPN 连接)
        ▼
-[sing-box 引擎启动]
+[系统后台拉起 VPN 进程 (SingBox.Task)]
        │
-       │ (9. 引擎创建 winRTVpn 实例作为 TUN 设备)
-       │ (10. 用户点击 UWP 界面上的连接开关)
-       │ (11. UWP 调用 VpnManagementAgent 触发连接)
-       ▼
-[VpnBridge: VpnPlugin::Connect(channel)]
-       │
-       │ (12. 系统将 VpnBridge.dll 拉起到 UWP 进程内)
-       │ (13. channel.StartWithMainTransport 启动 VPN 通道)
+       │ (4. 系统拉起 SingBox.Task，实例化 VpnPlugin 类)
+       │ (5. VpnPlugin::Connect 触发，调用 LoadPackagedLibrary 加载 libbox.dll)
+       │ (6. 调用 libbox.Setup 传入沙盒 LocalFolder 路径)
+       │ (7. purego 动态绑定 SingBox.Task.dll 的 C 导出函数)
+       │ (8. syscall.NewCallback(goOnEncapsulate) 生成 C 函数指针)
+       │ (9. 调用 VpnBridge_RegisterPlugin(cb) 注册出站回调)
+       │ (10. 调用 libbox.Start 启动引擎)
+       │ (11. channel.StartWithMainTransport 启动 VPN 通道)
        ▼
 [引擎正常工作，通过指针回调收发数据]
 ```
@@ -171,71 +163,30 @@ func injectPacketToWinRT(packet []byte) bool {
 
 ## 6. 构建步骤指南
 
-构建过程现涵盖三个部分，全链路依赖 CMake：
+构建过程分为 Go 引擎构建和 Visual Studio 原生编译两个部分：
 
 ### 阶段一：构建 Go 代理核心 (libbox.dll)
 
-因为 `-buildmode=c-shared` 要求入口为 `main` 包，我们需要创建一个封装用的 `go_dll` 目录（包含 `main.go` 并配置 `go.mod` 替换本地代码），在此目录下运行构建。
+因为 `-buildmode=c-shared` 要求入口为 `main` 包，我们需要创建一个封装用的 `go_dll` 目录。
+注意：现在 `SingBox.Task` 项目已经配置了 **Pre-Build Event (生成前事件)**，在 Visual Studio 中编译时会自动执行此步骤。如果你需要手动编译：
 
-**注意：** 如果你修改了本地的 `sing-tun` 或 `sing-box` 代码，需要在 `sing-box` 和 `go_dll` 目录下的 `go.mod` 中使用 `replace` 指令指向本地相对路径：
-```powershell
-# 在 sing-box 目录下执行，让引擎引用本地的 sing-tun
-cd ../sing-box
-go mod edit -replace github.com/sagernet/sing-tun=../sing-tun
-go mod tidy
-
-# 在 go_dll 目录下执行
-cd ../go_dll
-go mod edit -replace github.com/sagernet/sing-box=../sing-box
-go mod edit -replace github.com/sagernet/sing-tun=../sing-tun
-go mod tidy
-```
-
-必须包含 `with_winrt_vpn` 标签：
 ```powershell
 cd go_dll
 $env:CGO_ENABLED="1"
-go build -buildmode=c-shared -v -trimpath -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_purego,with_clash_api,with_winrt_vpn,badlinkname,tfogo_checklinkname0" -ldflags "-X github.com/sagernet/sing-box/constant.Version=1.13.0 -s -w -buildid= -checklinkname=0" -o ../build/libbox.dll .
+go build -buildmode=c-shared -v -trimpath -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_purego,with_clash_api,with_winrt_vpn,badlinkname,tfogo_checklinkname0" -ldflags "-X github.com/sagernet/sing-box/constant.Version=1.13.0 -s -w -buildid= -checklinkname=0" -o ../SingBoxWinRT/SingBox.Task/libbox.dll .
 ```
 
-### 阶段二：构建 C++/WinRT 桥接层 (VpnBridge.dll)
+### 阶段二：使用 Visual Studio 构建 UWP 解决方案
 
-在 `sing-tun\winrt_vpn` 目录中使用 CMake 进行构建：
-```powershell
-cd sing-tun/winrt_vpn
-mkdir build
-cd build
-cmake .. -A x64
-cmake --build . --config Release
-```
-编译完成后，会生成 `build\Release\VpnBridge.dll`。
+由于 CMake 对 UWP XAML 和 WinMD 多项目支持较弱，我们彻底**抛弃了 CMake 方式**，改用原生的 Visual Studio 解决方案 (`SingBoxWinRT.slnx`)。
 
-### 阶段三：构建 UWP 宿主应用 (App.exe) 并注册
+1. 打开 Visual Studio，加载 `SingBoxWinRT.slnx`。
+2. 确保安装了 **C++/WinRT** 扩展，并执行一次 **还原 NuGet 程序包**。
+3. 选择 `x64` 和 `Release/Debug`。
+4. 右键 `SingBox.App` 项目 -> **设为启动项目**。
+5. 点击 **生成解决方案 (F7)** 或 **部署**。
 
-在工程外层 `UwpHost` 目录中开启 UWP 构建：
-```powershell
-cd UwpHost
-mkdir build
-cd build
-cmake .. -A x64
-cmake --build . --config Release
-```
-
-- 为了避开 CMake 编译 UWP XAML 的严重路径 Bug，UWP 宿主已被设计为**纯 CoreWindow (无 XAML)**。
-- 编译完成后，将前两个阶段生成的 `libbox.dll`、`VpnBridge.dll` 以及本阶段生成的 `UwpHost.exe` 拷贝至 `AppxLayout` 目录下。
-- 最后，在 PowerShell 中使用 `Add-AppxPackage -Register` 进行开发者注册和免打包调试：
-
-```powershell
-# 1. 复制所有生成的产物到 AppxLayout 目录
-Copy-Item "build\Release\UwpHost.exe" -Destination "AppxLayout" -Force
-Copy-Item "..\sing-tun\winrt_vpn\build\Release\VpnBridge.dll" -Destination "AppxLayout" -Force
-Copy-Item "..\build\libbox.dll" -Destination "AppxLayout" -Force
-
-# 2. 注册 UWP 应用
-Add-AppxPackage -Register "AppxLayout\AppxManifest.xml"
-```
-
-注册成功后，即可在系统“开始”菜单中找到并启动该应用。
+*Visual Studio 会自动按顺序执行：执行 go build -> 编译 Task 后台组件 -> 编译 App 前端 -> 将 libbox.dll 打包进最终的 Appx 中。*
 
 ---
 

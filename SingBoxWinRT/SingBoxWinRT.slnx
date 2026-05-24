@@ -1,0 +1,14 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM" />
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="SingBox.App/SingBox.App.vcxproj" Id="a8e1f3ad-134a-40dc-a0d5-d50e2fed2024">
+    <Deploy Solution="*|ARM64" />
+    <Deploy Solution="*|x64" />
+    <Deploy Solution="*|x86" />
+  </Project>
+  <Project Path="SingBox.Task/SingBox.Task.vcxproj" Id="f0375707-d118-40e5-95c3-77315705b753" />
+</Solution>
