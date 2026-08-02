@@ -1,8 +1,0 @@
-namespace SingBox_Task
-{
-    [default_interface]
-    runtimeclass Class : Windows.ApplicationModel.Background.IBackgroundTask
-    {
-        Class();
-    }
-}

@@ -298,3 +298,126 @@ void* netstack_release(NetStackHandle* ptr);
 - **Fake Socket 的端口占用**：自连接 UDP 会占用一个 127.0.0.1 端口，多实例时需注意
 - **`ExcludeLocalSubnets(true)`**：必须排除本地子网，否则访问局域网设备会绕回 VPN 接口
 
+---
+
+## 进阶：UWP VPN broker 进程模型 vs iOS Extension 进程模型
+
+上面的 hack 解决了"如何把代理引擎塞进 WinRT VPN"的**数据流**问题。但如果要把 mihomo（Go）或 Leaf（Rust）这样的代理引擎**完整集成**到 UWP VPN 体系中，还必须理解 broker 进程与 iOS Extension 进程的**进程模型差异**——这决定了代理引擎运行时的生命周期、线程模型和能力边界。
+
+### 核心差异：谁拥有进程
+
+| | iOS Extension | Android VpnService | UWP broker + IVpnPlugIn DLL |
+|---|---|---|---|
+| **进程谁拥有** | Extension 代码（自己有 `main()`） | App 自己的进程 | 系统 broker 代码（DLL 无 `main()`） |
+| **主循环谁驱动** | Extension 自己的 `NSRunLoop`/`CFRunLoop` | App 的 Looper/MessageQueue | 系统的 COM 消息循环 |
+| **VPN 事件到达方式** | run loop 分发到 delegate 回调 | Service 生命周期 + 回调 | COM 虚函数调用 `IVpnPlugIn` 方法 |
+| **代理引擎在哪跑** | Extension 进程内（Go runtime 线程） | App 进程内（Go runtime 线程） | broker 进程内（Go runtime 线程，作为 guest） |
+| **能否控制进程退出** | ✅ 能（退出 main 即退进程） | ✅ 能 | ❌ 不能（Go 退出只停 runtime，broker 仍活着） |
+| **进程崩了谁重启** | 系统 `nesmartcl` | 系统 ActivityManager | 系统 broker 管理器 |
+
+### iOS Extension：代理引擎是进程的"主人"
+
+iOS 的 `NEPacketTunnelProvider` 必须实现为 **App Extension**，而 App Extension 在 iOS 上的定义就是**由系统拉起的独立进程**：
+
+```
+iOS Extension 进程:
+  main() → 属于 Extension 代码
+    └→ NSRunLoop ← Extension 自己拥有和驱动
+    └→ nesmartcl 通过 XPC 发来事件 → run loop 分发
+    └→ Extension 代码掌控进程生命周期
+    └→ mihomo Go runtime 在"自己的地盘"上运行
+```
+
+iOS 强制 Extension 为独立进程的原因：
+
+1. **后台存活**：iOS 对后台 App 极其激进——切后台几秒即 suspend。如果 VPN 跑在 App 进程里，App 被 suspend 就断了。Extension 进程由系统 `nesmartcl` 守护，有独立后台执行权限，不跟随容器 App 生命周期。
+2. **权限隔离**：普通 App 沙箱没有操作网络栈的权限。`networkextension` entitlement 只赋予 Extension 进程，不赋予容器 App 进程。VPN 和 App 在不同进程 = 不同沙箱 = 不同权限。
+3. **崩溃隔离**：VPN 代码 crash 不影响 App UI，App crash 不影响 VPN 隧道。
+
+### UWP broker：代理引擎是进程的"客人"
+
+UWP 的 VPN 系统由系统拉起一个 **broker 进程**，加载注册的 `IVpnPlugIn` 实现（一个 DLL）。broker 进程的 `main()` 是系统代码，COM 消息循环由系统驱动，DLL 只是系统在需要时通过虚函数表调用的一个对象：
+
+```
+UWP broker 进程:
+  main() → 属于系统 broker 代码（不可见、不可控）
+    └→ COM 消息循环 ← 系统拥有和驱动
+    └→ 系统在消息循环中调用 IVpnPlugIn 的方法
+    └→ DLL 是被调用的 guest，不掌控进程
+    └→ mihomo Go runtime 在"别人的地盘"上运行
+```
+
+broker 主线程大致这样运行：
+
+```
+COM 消息循环 {
+    "VPN 需要连接"       → 调用 IVpnPlugIn::Connect()
+    "出站 IP 包到达"     → 调用 IVpnPlugIn::Encapsulate()
+    "transport 数据到达" → 调用 IVpnPlugIn::Decapsulate()
+    "VPN 需要断开"       → 调用 IVpnPlugIn::Disconnect()
+    定时器到期           → 调用 IVpnPlugIn::GetKeepAlivePayload()
+}
+```
+
+DLL 的每个方法都是**被调者**。broker 调完就期望返回，它要继续处理消息循环。**不能在 `Encapsulate` 里阻塞等代理引擎处理完**——那会卡死 broker 的消息循环。
+
+### Go runtime 作为 guest 的线程模型
+
+虽然 DLL 没有主循环，但 Go c-shared 模式加载后，Go runtime 会创建自己的 OS 线程。这些线程独立于 broker 的 COM 线程运行：
+
+```
+broker 主线程 (回调驱动):
+  Connect()     → 调 Go 导出函数 → 初始化 mihomo → 立即返回
+  Encapsulate() → 调 Go 导出函数 → 把 IP 包丢进 channel → 立即返回
+  Decapsulate() → 空函数，直接返回
+
+Go runtime 自己的线程 (后台独立运行):
+  线程1: Go scheduler (M machine)
+  线程2: Go GC、sysmon
+  线程3: 网络轮询器 (IOCP)
+  线程4: gVisor stack goroutine → 从 channel 读 IP 包 → 处理 → 代理出站
+  线程5: 代理引擎 goroutine → 收到入站数据 → 调 C++ 回调 → VpnChannel 注入
+```
+
+这正是前面 Hack 方案的做法：
+
+- **出站（被动入场）**：broker 调 `Encapsulate` → Go 导出函数把包丢进 channel → 立即返回 → Go 后台线程从 channel 取包处理
+- **入站（主动注入）**：Go 后台线程的 goroutine 收到代理引擎数据 → 通过 cgo 调 C++ 回调 → C++ 调 `GetVpnReceivePacketBuffer` + `AppendVpnReceivePacketBuffer` + `FlushVpnReceivePacketBuffers`（线程安全 API）→ 通知系统有入站包
+
+入站注入完全绕过了 broker 的回调模型，是 Go 线程主动推送。README 前文已说明：
+
+> `AppendVpnReceivePacketBuffer` 可以在任意线程调用：`VpnChannel` 的 buffer API 是线程安全的，`FlushVpnReceivePacketBuffers` 负责通知系统
+
+### Android CMFA 的参照
+
+Android 的 ClashMetaForAndroid（CMFA）已经验证了"Go runtime 作为 guest 运行在系统拉起的进程内"这一模式：
+
+```
+Android:
+  App 进程
+    └→ VpnService 组件 (运行在 App 进程内)
+         └→ libmihomo.so (Go c-shared)
+              └→ 系统给一个 TUN fd → Go runtime 线程处理
+              └→ EmbedMode = true (禁止 restart/upgrade)
+```
+
+UWP 的 broker + DLL 模式在架构上与此对应，只是：
+- Android：进程是 App 自己的，Go `.so` 在 App 进程内
+- UWP：进程是系统 broker 的，Go `.dll` 在 broker 进程内
+
+mihomo 已有 `SetEmbedMode(true)` 的先例（`hub/route/patch_android.go`），UWP 场景只需类似的 build tag 做同样处理。
+
+### 实际影响与风险
+
+代理引擎作为 broker 进程的 guest 运行，有以下实际约束：
+
+1. **进程生命周期不可控**：系统随时可能终止/重启 broker 进程。Go runtime 每次 DLL 加载都重新初始化，mihomo 状态（连接、配置）需持久化或从外部加载。mihomo 的 `/restart` API 在 embed mode 下已禁用，符合此约束。
+
+2. **回调必须快速返回**：`Encapsulate`/`Decapsulate` 等方法运行在 broker 的 COM 线程上，不能阻塞。必须将工作交给后台线程（Go goroutine）异步处理，回调本身只做"丢包进 channel + 立即返回"。
+
+3. **Go 信号处理冲突**：Go runtime 会安装 SEH/VEH 处理器，在非 Go 拥有的进程里可能与 broker 自身的异常处理冲突。可通过 `GODEBUG=asyncpreemptoff=1` 和 `GODEBUG=cgocheck=0` 缓解，需实测。
+
+4. **API server 监听**：mihomo 的 RESTful API（`hub/route/server.go`）需要监听 TCP/Named Pipe。在 broker 进程的沙箱内可能受限，可考虑用 Named Pipe 或 Unix Socket（Windows 支持 AF_UNIX）替代。
+
+5. **替代方案——进程外模型**：如果 broker 进程的沙箱/信号问题无法解决，可采用 IPC 方案：VpnPlugin.dll 只做 WinRT VPN 桥接（纯 C++/WinRT，不含 Go），通过共享内存 ring buffer 与独立的 mihomo.exe 进程交换 IP 包。UWP App 通过 `FullTrustProcessLauncher`（需要 `runFullTrust` capability）拉起 mihomo.exe，后者有完整 Win32 权限。此方案更接近 iOS 的"独立进程"模型，但代价是 IPC 开销和更复杂的进程管理。
+
